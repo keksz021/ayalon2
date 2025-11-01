@@ -1,0 +1,243 @@
+
+	uint32_t CGifImageBox::Type()
+	{
+		static uint32_t s_dwType = GetCRC32("CGifImageBox", strlen("CGifImageBox"));
+		return (s_dwType);
+	}
+
+	BOOL CGifImageBox::OnIsType(uint32_t dwType)
+	{
+		if (CGifImageBox::Type() == dwType)
+			return TRUE;
+
+		return FALSE;
+	}
+
+	CGifImageBox::CGifImageBox(PyObject* ppyObject)
+		: CAniImageBox(ppyObject)
+	{
+	}
+	CGifImageBox::~CGifImageBox()
+	{
+	}
+
+	// Segéd: transparency index kinyerése a GCE-ből
+	static int GetTransparentIndex(const SavedImage* frame) {
+		if (!frame) return -1;
+		for (int i = 0; i < frame->ExtensionBlockCount; ++i) {
+			const ExtensionBlock& eb = frame->ExtensionBlocks[i];
+			if (eb.Function == GRAPHICS_EXT_FUNC_CODE && eb.ByteCount >= 4) {
+				const uint8_t* b = reinterpret_cast<const uint8_t*>(eb.Bytes);
+				if (b[0] & 0x01) // Transparency Flag
+					return b[3]; // Transparent Color Index
+			}
+		}
+		return -1;
+	}
+
+	// 32 bites BGRA BMP készítése EGY frame-ből, a teljes logikai vászonra helyezve
+	static bool RawFrameToBmpImage_BGRA(
+		SavedImage* currentFrame,
+		GifFileType* gifFile,
+		std::vector<uint8_t>& outData
+	) {
+		if (!currentFrame || !gifFile || !gifFile->SColorMap)
+			return false;
+
+		const GifImageDesc& desc = currentFrame->ImageDesc;
+		const ColorMapObject* cmap = desc.ColorMap ? desc.ColorMap : gifFile->SColorMap;
+		if (!cmap || !cmap->Colors) return false;
+
+		// Teljes vászon (LOGICAL SCREEN)
+		const int canvasW = gifFile->SWidth;
+		const int canvasH = gifFile->SHeight;
+
+		// A frame saját mérete és eltolása
+		const int W = desc.Width;
+		const int H = desc.Height;
+		const int offX = desc.Left;
+		const int offY = desc.Top;
+
+		// Kimeneti 32bpp BGRA BMP (bottom-up)
+		const uint32_t bitCount = 32;
+		const uint32_t bytesPerPixel = 4;
+		const uint32_t rowStride = canvasW * bytesPerPixel;
+		const uint32_t pixelBytes = rowStride * canvasH;
+
+		BITMAPFILEHEADER bf = {};
+		bf.bfType = 0x4D42; // "BM"
+		bf.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
+		bf.bfSize = bf.bfOffBits + pixelBytes;
+
+		BITMAPINFOHEADER bi = {};
+		bi.biSize = sizeof(BITMAPINFOHEADER);
+		bi.biWidth = canvasW;
+		bi.biHeight = canvasH;             // bottom-up
+		bi.biPlanes = 1;
+		bi.biBitCount = (WORD)bitCount;      // 32 bpp
+		bi.biCompression = BI_RGB;
+		bi.biSizeImage = pixelBytes;
+
+		outData.resize(bf.bfSize);
+		std::memcpy(outData.data(), &bf, sizeof(bf));
+		std::memcpy(outData.data() + sizeof(bf), &bi, sizeof(bi));
+
+		// BGRA vászon nullázása (A=0 -> teljesen átlátszó)
+		uint8_t* dst = outData.data() + bf.bfOffBits;
+		std::memset(dst, 0x00, pixelBytes);
+
+		// Interlace kezelés
+		const uint8_t* src = reinterpret_cast<const uint8_t*>(currentFrame->RasterBits);
+		const bool interlaced = !!desc.Interlace;
+		const int transparent = GetTransparentIndex(currentFrame);
+
+		auto put = [&](int x, int y, uint8_t idx) {
+			if (x < 0 || y < 0 || x >= canvasW || y >= canvasH) return;
+			if (transparent >= 0 && idx == (uint8_t)transparent) return; // hagyd átlátszón
+
+			const GifColorType& c = cmap->Colors[idx];
+			// bottom-up BMP sorindex
+			const int by = (canvasH - 1 - y);
+			uint8_t* p = dst + by * rowStride + x * bytesPerPixel;
+			p[0] = c.Blue;
+			p[1] = c.Green;
+			p[2] = c.Red;
+			p[3] = 255; // alpha
+			};
+
+		if (!interlaced) {
+			// sorfolytonos
+			for (int y = 0; y < H; ++y) {
+				const uint8_t* row = src + y * W;
+				for (int x = 0; x < W; ++x)
+					put(offX + x, offY + y, row[x]);
+			}
+		}
+		else {
+			// GIF interlace 4 pass
+			const int starts[4] = { 0, 4, 2, 1 };
+			const int steps[4] = { 8, 8, 4, 2 };
+			int offset = 0;
+			for (int p = 0; p < 4; ++p) {
+				for (int y = starts[p]; y < H; y += steps[p]) {
+					const uint8_t* row = src + offset;
+					for (int x = 0; x < W; ++x)
+						put(offX + x, offY + y, row[x]);
+					offset += W;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	// Memória-olvasó giflibhez
+	struct GifMemReader {
+		const unsigned char* data = nullptr;
+		size_t size = 0;
+		size_t pos = 0;
+	};
+	static int GifReadFunc(GifFileType* file, GifByteType* buf, int sz) {
+		GifMemReader* r = reinterpret_cast<GifMemReader*>(file->UserData);
+		if (!r || r->pos >= r->size) return 0;
+		int n = int(std::min<size_t>(sz, r->size - r->pos));
+		memcpy(buf, r->data + r->pos, n);
+		r->pos += n;
+		return n;
+	}
+
+	bool CGifImageBox::LoadGif(const char* c_szFileName)
+	{
+		if (!c_szFileName || !*c_szFileName)
+			return false;
+
+		UnloadGif(); // előző frame-ek törlése
+
+		CMappedFile file;
+		LPCVOID pData = nullptr;
+
+		// PACK-ból beolvasás (a te 3 paraméteres Get-ed szerint)
+		if (!CEterPackManager::Instance().Get(file, c_szFileName, &pData)) {
+			TraceError("GIF not found in pack: %s", c_szFileName);
+			return false;
+		}
+
+		if (!pData || !file.Size()) {
+			TraceError("GIF mapped but empty: %s", c_szFileName);
+			return false;
+		}
+
+		GifMemReader reader;
+		reader.data = reinterpret_cast<const unsigned char*>(pData);
+		reader.size = file.Size();
+		reader.pos = 0;
+
+		int error = 0;
+		GifFileType* gif = DGifOpen(&reader, GifReadFunc, &error);
+		if (!gif) {
+			const char* err = GifErrorString(error);
+			TraceError("DGifOpen failed for %s: %s", c_szFileName, err ? err : "unknown");
+			return false;
+		}
+
+		if (DGifSlurp(gif) == GIF_ERROR) {
+#if GIFLIB_MAJOR >= 5
+			DGifCloseFile(gif, &error);
+#else
+			DGifCloseFile(gif);
+#endif
+			TraceError("Failed to read GIF file: %s", c_szFileName);
+			return false;
+		}
+
+		for (int i = 0; i < gif->ImageCount; ++i) {
+			SavedImage* currentImage = &gif->SavedImages[i];
+
+			std::vector<uint8_t> bmpBuffer;
+			if (!RawFrameToBmpImage_BGRA(currentImage, gif, bmpBuffer)) {
+				TraceError("Failed to convert GIF(%s) frame #%d to BMP image.", c_szFileName, i);
+				continue;
+			}
+
+			char frameFileName[256] = { 0 };
+#if defined(_MSC_VER)
+			_snprintf_s(frameFileName, _TRUNCATE, "gif_frame_%d.tmp.bmp", i);
+#else
+			_snprintf_s(frameFileName, _TRUNCATE, "gif_frame_%d.tmp.bmp", i);
+#endif
+
+			CGraphicImage* pImage = new CGraphicImage(frameFileName, bmpBuffer.data(), (DWORD)bmpBuffer.size(), D3DX_FILTER_LINEAR);
+			if (!pImage) {
+				TraceError("Failed to create image instance for GIF(%s) frame #%d.", c_szFileName, i);
+				continue;
+			}
+
+			CGraphicExpandedImageInstance* pImageInstance = CGraphicExpandedImageInstance::New();
+			pImageInstance->SetImagePointer(pImage);
+
+			if (pImageInstance->IsEmpty())
+				CGraphicExpandedImageInstance::Delete(pImageInstance);
+			else {
+				pImageInstance->SetPosition(m_rect.left, m_rect.top);
+				m_ImageVector.push_back(pImageInstance);
+			}
+		}
+
+#if GIFLIB_MAJOR >= 5
+		DGifCloseFile(gif, &error);
+#else
+		DGifCloseFile(gif);
+#endif
+
+		return !m_ImageVector.empty();
+		}
+
+	bool CGifImageBox::UnloadGif()
+	{
+		for (auto pImage : m_ImageVector)
+			CGraphicExpandedImageInstance::Delete(pImage);
+
+		m_ImageVector.clear();
+		return true;
+	}
+
