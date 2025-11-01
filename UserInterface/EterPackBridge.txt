@@ -1,0 +1,28 @@
+#include "StdAfx.h"
+#include "EterPackManager.h"
+#include "MappedFile.h"
+
+// Csak azt a szimbólumot adjuk meg, amit a lib keres.
+// Nem kell shim header, nem kell namespace-alias, nem kell semmi extra.
+
+namespace UI
+{
+    // Elődekl., hogy a linkernek legyen mibe kapaszkodni
+    class CEterPackManager
+    {
+    public:
+        static CEterPackManager& Instance();
+        bool Get(CMappedFile& rMappedFile, const char* c_szFileName, const void** pData);
+    };
+
+    // A globális singletonra forwardolunk.
+    CEterPackManager& CEterPackManager::Instance()
+    {
+        return *reinterpret_cast<CEterPackManager*>(&::CEterPackManager::Instance());
+    }
+
+    bool CEterPackManager::Get(CMappedFile& rMappedFile, const char* c_szFileName, const void** pData)
+    {
+        return ::CEterPackManager::Instance().Get(rMappedFile, c_szFileName, pData);
+    }
+}
